@@ -14,19 +14,20 @@ warnings.filterwarnings('ignore')
 PPO_PARAMS = {
     "n_steps": 2048,
     "ent_coef": 0.01,
-    "learning_rate": 0.00025,
+    "learning_rate": 0.0001,
     "batch_size": 128,
 }
 
 
-def train_and_evaluate(total_timesteps=50000):
+def train_and_evaluate(total_timesteps=100000,seed=42):
     train_df, test_df, tickers, env_train_fn = build_portfolio_envs()
 
     # --- train ---
     env_train = DummyVecEnv([env_train_fn])
     env_train = VecNormalize(env_train, norm_obs=True, norm_reward=True, clip_obs=10.0)
-    print(f'\nTraining PPO agent on {len(tickers)}-stock portfolio...')
-    model = PPO("MlpPolicy", env_train, verbose=1, **PPO_PARAMS)
+    env_train.seed(seed)
+    print(f'\nTraining PPO agent on {len(tickers)}-stock portfolio (seed={seed})...')
+    model = PPO("MlpPolicy", env_train, verbose=1,seed=seed, **PPO_PARAMS)
     model.learn(total_timesteps=total_timesteps)
 
     os.makedirs("./trained_models", exist_ok=True)
@@ -43,13 +44,19 @@ def train_and_evaluate(total_timesteps=50000):
 
     obs = env_test.reset()
     net_worths = []
+    action_history=[]
     dates = test_df.index.tolist()
     for i in range(len(test_df) - 1):
         action, _ = model.predict(obs, deterministic=True)
+        action_history.append(action[0])
         obs, reward, done, info = env_test.step(action)
         net_worths.append(info[0]['net_worth'])
         if done[0]:
             break
+
+    action_df=pd.DataFrame(action_history,columns=tickers)
+    action_df.to_csv("agent_actions_history.csv",index=False)
+    print(f"Saved {len(action_history)} steps of agent decisions to agent_actions_history.csv")
 
     df_account_value = pd.DataFrame({
         'date': dates[1:len(net_worths) + 1],
@@ -68,6 +75,7 @@ def train_and_evaluate(total_timesteps=50000):
 
     # sanity check the two series before handing them to pyfolio
     benchmark_returns.name="Nifity50_EqualWeight"
+    agent_returns.name="RL Agent"
     agent_total_return=(1+agent_returns).prod()-1
     bench_total_return=(1+benchmark_returns).prod()-1
     print(f"\nCommon dates for comparison: {len(common_dates)}")

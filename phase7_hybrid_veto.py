@@ -31,11 +31,14 @@ def fetch_rss_news(query_keyword,max_articles=5):
 
     feed=feedparser.parse(rss_url)
 
-    headlines=[]
+    articles=[]
     for entry in feed.entries[:max_articles]:
         if hasattr(entry,'title') and entry.title:
-            headlines.append(entry.title)
-    return headlines
+            articles.append({
+                "title":entry.title,
+                "link":getattr(entry,"link","#")
+            })
+    return articles
 
 TICKER_NAME_MAP = {
     "ABB": "ABB India",
@@ -129,17 +132,17 @@ def get_live_sentiment(ticker_symbol, sentiment_model, max_articles=5):
     company_name=TICKER_NAME_MAP.get(clean_ticker,clean_ticker)
     try:
         
-        headlines=fetch_rss_news(company_name,max_articles=max_articles)
+        articles=fetch_rss_news(company_name,max_articles=max_articles)
 
-        if not headlines:
+        if not articles:
             return 0.0,[]
 
-
+        headlines=[a["title"]for a in articles]
         results=sentiment_model(headlines)
         net_score=0.0
         details=[]
                 
-        for headline,res in zip(headlines,results):
+        for articles,res in zip(articles,results):
             label=res['label'].lower()
             score =float(res['score'])
 
@@ -148,7 +151,11 @@ def get_live_sentiment(ticker_symbol, sentiment_model, max_articles=5):
             elif label=='negative':
                 net_score-=score
 
-            details.append((headline,res))
+            details.append({
+                "headline":articles["title"],
+                "link":articles["link"],
+                "res":res
+            })
         return net_score,details
     except Exception as e:
         print(f"  [FAIL] News fetch for {clean_ticker}: {type(e).__name__}: {e}")
@@ -171,7 +178,7 @@ def run_hybrid_veto_system(auto_veto=False):
     
     for ticker in tickers:
         try:
-            df = yf.download(ticker, period="3mo", progress=False)
+            df = yf.download(ticker, period="2y", progress=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             if df.empty or len(df) < 30:
@@ -213,11 +220,26 @@ def run_hybrid_veto_system(auto_veto=False):
     
     done = [False]
     target_action = None
+    history_records=[]
+    step_idx=0
     
     while not done[0]:
         action, _ = model.predict(obs, deterministic=True)
         target_action = action[0]
         obs, reward, done, info = env.step(action)
+
+        current_date=combined.index[min(step_idx,len(combined)-1)]
+        val=info[0].get("portfolio_value",None)
+        if val is None:
+            raw_inner = env_raw.envs[0]
+            val = getattr(raw_inner, "net_worth", None)
+            if val is None:
+                raise AttributeError(
+                f"Could not find net_worth on {type(raw_inner)}. "
+                f"Available: {[a for a in dir(raw_inner) if not a.startswith('_')]}"
+            )
+        history_records.append({"date":current_date,"value":float(val)})
+        step_idx+=1
 
     positive_action = np.clip(target_action, 0, None)
     action_sum = np.sum(positive_action)
@@ -246,7 +268,8 @@ def run_hybrid_veto_system(auto_veto=False):
     print("==================================================")
     
     final_portfolio = {}
-    vetoed_trades = []
+    pending_review = []
+    all_sentiment_log=[]
     cash_buffer = dust_weight
     
     for ticker, target_weight in target_portfolio_raw.items():
@@ -254,30 +277,28 @@ def run_hybrid_veto_system(auto_veto=False):
         score, details = get_live_sentiment(symbol_ns, sentiment_model)
         
         print(f"\nStock: {ticker:<12} | Agent Target: {target_weight*100:.1f}% | Net Sentiment: {score:+.2f}")
+
+        all_sentiment_log.append({
+            "ticker":ticker,
+            "target_weight":round(target_weight*100,2),
+            "sentiment_score":round(score,2),
+            "headline_sample":details[0]["headline"] if details else "No recent headlines",
+            "link":details[0]["link"] if details else "#",
+            "vetoed":score<SENTIMENT_THRESHOLD,
+        })
         
         if score < SENTIMENT_THRESHOLD:
-            print(f"🛑 [VETO ALERT] Negative sentiment threshold breached ({score:.2f})!")
-            
-            if auto_veto:
-                veto_confirmed = True
-            else:
-                choice = input(f"   Do you want to VETO and block the trade for {ticker}? ([y]/N override): ").strip().lower()
-                veto_confirmed = (choice != 'n')
-            
-            if veto_confirmed:
-                print(f"   🛑 [CONFIRMED] Trade blocked. Rerouting allocation to cash reserve.")
-                cash_buffer += target_weight
-                vetoed_trades.append({
-                    "ticker": ticker,
-                    "target_weight": round(target_weight * 100, 2),
-                    "sentiment_score": round(score, 2),
-                    "headline_sample": details[0][0] if details else "Negative news breach"
-                })
-            else:
-                print(f"   ✅ [OVERRIDE] Executing trade for {ticker}.")
-                final_portfolio[ticker] = round(target_weight * 100, 2)
+            print(f"🛑 [FLAGGED] Sending {ticker} to forntend for user review")
+
+            pending_review.append({
+                "ticker":ticker,
+                "target_weight":round(target_weight*100,2),
+                "sentiment_score":round(score,2),
+                "headline_sample":details[0]["headline"] if details else "Negative news breach",
+                "link":details[0]["link"] if details else "#",
+            })
         else:
-            print(f"   ✅ [APPROVED] Sentiment within safe limits. Clear to execute.")
+            print(f"   ✅ [APPROVED] Clear to execute")
             final_portfolio[ticker] = round(target_weight * 100, 2)
 
     print("\n==================================================")
@@ -288,15 +309,44 @@ def run_hybrid_veto_system(auto_veto=False):
     print(f"  CASH RESERVE: {cash_buffer*100:.1f}%")
     print("==================================================")
 
+    formatted_performance=[]
+    sharpe_ratio=None
+    if history_records:
+        perf_df=pd.DataFrame(history_records).set_index("date")
+        monthly_series=perf_df["value"].resample("ME").last().dropna()
+        if not monthly_series.empty:
+            base_val=float(monthly_series.iloc[0])
+            for ts,close_val in monthly_series.items():
+                formatted_performance.append({
+                    "month": pd.Timestamp(ts).strftime("%b %y"),
+                    "ai": round(float(close_val) / base_val, 4) if base_val > 0 else 1.0
+                })
+
+            monthly_returns=monthly_series.pct_change().dropna()
+            if len(monthly_returns)>1 and monthly_returns.std()>0:
+                risk_free_annual=0.065
+                risk_free_monthly=risk_free_annual/12
+                excess_returns=monthly_returns-risk_free_monthly
+                sharpe_ratio=float(
+                    (excess_returns.mean()/monthly_returns.std())*np.sqrt(12)
+                )
+                sharpe_ratio=round(sharpe_ratio,2)
+
+    print("Sample performance_history:", formatted_performance[:3], "...", formatted_performance[-3:])
+    print("Sharpe ratio computed:", sharpe_ratio)
+
     # Return structured dict for FastAPI / external calls
     return {
         "active_allocations": final_portfolio,
         "cash_reserve": round(cash_buffer * 100, 2),
-        "vetoed_trades": vetoed_trades
+        "pending_review": pending_review,
+        "performance_history":formatted_performance,
+        "sharpe_ratio":sharpe_ratio,
+        "sentiment_log":all_sentiment_log
     }
+
+
 
 
 if __name__ == "__main__":
     run_hybrid_veto_system(auto_veto=False)
-if __name__ == "__main__":
-    run_hybrid_veto_system()

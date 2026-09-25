@@ -1,2 +1,5 @@
 __pycache__/
 rl_finance_env/
+node_modules/
+server/node_modules/
+client/node_modules/

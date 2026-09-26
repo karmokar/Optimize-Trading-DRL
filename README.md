@@ -147,4 +147,4 @@ This project is for educational and research purposes. It does not constitute fi
 
 ## License
 
-*(Add your chosen license here — e.g. MIT)*
+MIT — see LICENSE for details.
